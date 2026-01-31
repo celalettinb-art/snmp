@@ -1,242 +1,333 @@
 #!/usr/bin/env bash
 
-# Description: Install and configure SNMPv3 on Debian with secure defaults.
-# All messages are in English, interactive questions are bold and yellow.
-# This script configures snmpd for SNMPv3 only, on UDP port 161.
-# It stores credentials and settings also in ~/snmpd.creds.
+# SNMPv3 setup for Debian
+# Installs and configures snmpd (SNMPv3 only) on UDP/161
+# Creates a read-only SNMPv3 user with the strongest supported auth/priv methods
+# Restricts UDP/161 by source CIDR via nftables firewall rules
+# Writes a summary to ~/snmpd.creds (for the invoking user)
 # Run the script -> bash -c "$(curl -fsSL https://raw.githubusercontent.com/celalettinb-art/snmp/refs/heads/main/install-and-configure-snmpv3-on-debian.sh)"
 
 set -euo pipefail
 
-SNMPD_CONF="/etc/snmp/snmpd.conf"
-CREDS_FILE="$HOME/snmpd.creds"
+# ======= Colors =======
+RED="$(tput setaf 1 || true)"
+GREEN="$(tput setaf 2 || true)"
+YELLOW="$(tput setaf 3 || true)"
+BLUE="$(tput setaf 4 || true)"
+BOLD="$(tput bold || true)"
+RESET="$(tput sgr0 || true)"
 
-# Colors
-BOLD_YELLOW="\e[1;33m"
-BOLD_GREEN="\e[1;32m"
-BOLD_RED="\e[1;31m"
-BOLD_CYAN="\e[1;36m"
-RESET="\e[0m"
+info()  { echo "${BLUE}[i]${RESET} $*"; }
+ok()    { echo "${GREEN}[✓]${RESET} $*"; }
+warn()  { echo "${YELLOW}[!]${RESET} $*"; }
+fail()  { echo "${RED}[x]${RESET} $*"; exit 1; }
 
-# Checks
-if [[ $EUID -ne 0 ]]; then
-  echo -e "${BOLD_RED}Error: This script must be run as root (use sudo).${RESET}"
-  exit 1
+prompt_yellow_bold() {
+  # Usage: prompt_yellow_bold "Question: " VAR
+  local q="$1"
+  local __varname="$2"
+  read -r -p "$(echo -e "${BOLD}${YELLOW}${q}${RESET}")" "$__varname"
+}
+
+# ======= Root check =======
+if [[ "${EUID}" -ne 0 ]]; then
+  fail "Please run this script as root (e.g. using sudo)."
 fi
 
-command -v apt >/dev/null 2>&1 || {
-  echo -e "${BOLD_RED}Error: This script is intended for Debian/Ubuntu systems with apt.${RESET}"
-  exit 1
-}
+# ======= Determine target home for creds file =======
+# If started via sudo, write creds to the invoking user's home (not /root).
+TARGET_USER="${SUDO_USER:-root}"
+TARGET_HOME="$(getent passwd "${TARGET_USER}" | cut -d: -f6 || true)"
+if [[ -z "${TARGET_HOME}" || ! -d "${TARGET_HOME}" ]]; then
+  TARGET_HOME="${HOME}"
+fi
+CREDS_FILE="${TARGET_HOME}/snmpd.creds"
 
-# Helper to ask non-empty input
-ask_non_empty() {
-  local prompt="$1"
-  local var
-  while true; do
-    echo -en "${BOLD_YELLOW}${prompt}${RESET} "
-    read -r var
-    if [[ -n "${var}" ]]; then
-      printf '%s\n' "${var}"
-      return 0
-    else
-      echo -e "${BOLD_RED}Input must not be empty. Please try again.${RESET}"
-    fi
-  done
-}
+# ======= Input: Allowed CIDR =======
+prompt_yellow_bold "From which IP address range (CIDR) should SNMP requests be accepted? (e.g. 192.168.1.0/24): " ALLOW_CIDR
+ALLOW_CIDR="${ALLOW_CIDR//[[:space:]]/}"
+if [[ -z "${ALLOW_CIDR}" ]]; then
+  fail "No IP address range provided."
+fi
 
-# Helper: validate email (simple regex)
-validate_email() {
-  local email="$1"
-  [[ "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
-}
+# Basic CIDR sanity check (not a full validator)
+if ! [[ "${ALLOW_CIDR}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]]; then
+  warn "The CIDR value looks unusual: '${ALLOW_CIDR}'. Continuing anyway."
+fi
 
-ask_email() {
-  local prompt="$1"
-  local email
-  while true; do
-    echo -en "${BOLD_YELLOW}${prompt}${RESET} "
-    read -r email
-    if [[ -z "$email" ]]; then
-      echo -e "${BOLD_RED}E-mail address must not be empty.${RESET}"
-      continue
-    fi
-    if validate_email "$email"; then
-      printf '%s\n' "$email"
-      return 0
-    else
-      echo -e "${BOLD_RED}Invalid e-mail address format. Please try again.${RESET}"
-    fi
-  done
-}
-
-# Helper: ask IP/CIDR range (basic sanity)
-validate_cidr() {
-  local cidr="$1"
-  # Very simple IP/CIDR check; you may tighten if needed.
-  [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]]
-}
-
-ask_cidr() {
-  local prompt="$1"
-  local cidr
-  while true; do
-    echo -en "${BOLD_YELLOW}${prompt}${RESET} "
-    read -r cidr
-    if [[ -z "$cidr" ]]; then
-      echo -e "${BOLD_RED}IP range must not be empty.${RESET}"
-      continue
-    fi
-    if validate_cidr "$cidr"; then
-      printf '%s\n' "$cidr"
-      return 0
-    else
-      echo -e "${BOLD_RED}Invalid IPv4 or CIDR format. Example: 192.168.1.0/24 or 192.168.1.10${RESET}"
-    fi
-  done
-}
-
-# Helper: random credentials
-generate_random_string() {
-  local length="$1"
-  # Requires openssl
-  if ! command -v openssl >/dev/null 2>&1; then
-    echo -e "${BOLD_RED}Error: openssl is required but not installed.${RESET}"
-    exit 1
+# ======= Input: sysLocation (must not be empty) =======
+SYS_LOCATION=""
+while [[ -z "${SYS_LOCATION}" ]]; do
+  prompt_yellow_bold "Enter sysLocation (e.g. DC Berlin Rack 3): " SYS_LOCATION
+  SYS_LOCATION="${SYS_LOCATION//$'\r'/}"
+  SYS_LOCATION="${SYS_LOCATION#"${SYS_LOCATION%%[![:space:]]*}"}"
+  SYS_LOCATION="${SYS_LOCATION%"${SYS_LOCATION##*[![:space:]]}"}"
+  if [[ -z "${SYS_LOCATION}" ]]; then
+    warn "sysLocation must not be empty."
   fi
-  openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c "$length"
+done
+
+# ======= Input: sysContact email (must be valid and must not be empty) =======
+is_valid_email() {
+  local email="$1"
+  [[ "$email" =~ ^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$ ]]
 }
 
-# Install SNMP packages if needed
-echo -e "${BOLD_CYAN}Checking SNMP packages...${RESET}"
-if ! dpkg -s snmpd >/dev/null 2>&1 || ! dpkg -s snmp >/dev/null 2>&1; then
-  echo -e "${BOLD_CYAN}Installing snmpd and snmp packages...${RESET}"
-  apt update
-  apt install -y snmpd snmp
-else
-  echo -e "${BOLD_GREEN}snmpd and snmp are already installed.${RESET}"
+SYS_CONTACT=""
+while true; do
+  prompt_yellow_bold "Enter sysContact email address (e.g. admin@example.com): " SYS_CONTACT
+  SYS_CONTACT="${SYS_CONTACT//[[:space:]]/}"
+  if [[ -z "${SYS_CONTACT}" ]]; then
+    warn "sysContact must not be empty."
+    continue
+  fi
+  if is_valid_email "${SYS_CONTACT}"; then
+    ok "sysContact email validated."
+    break
+  else
+    warn "Invalid email format. Please enter a valid email address (e.g. admin@example.com)."
+  fi
+done
+
+# ======= Install packages (if missing) =======
+info "Installing required packages (snmpd, snmp, nftables, openssl) if not already installed..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y --no-install-recommends snmpd snmp nftables openssl
+ok "Packages are installed."
+
+# ======= Generate SNMPv3 credentials =======
+USERNAME="snmpv3_$(openssl rand -hex 4)"
+
+# SNMP passphrases must be at least 8 characters; use strong random strings.
+AUTH_PASS="$(openssl rand -base64 36 | tr -d '\n' | tr '/+' 'Aa' | cut -c1-28)"
+PRIV_PASS="$(openssl rand -base64 40 | tr -d '\n' | tr '/+' 'Bb' | cut -c1-32)"
+
+# ======= Pick strongest supported auth/priv protocols =======
+# We select the strongest options that are supported by the installed net-snmp tools.
+CREATE_HELP="$(net-snmp-create-v3-user -h 2>&1 || true)"
+
+pick_best_supported() {
+  # Args: help_text, candidates...
+  local help_text="$1"; shift
+  local c
+  for c in "$@"; do
+    if echo "${help_text}" | grep -qiE "(^|[^A-Z0-9_-])${c}([^A-Z0-9_-]|$)"; then
+      echo "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Prefer SHA-512 > SHA-384 > SHA-256 > SHA (fallback)
+AUTH_PROTO="$(pick_best_supported "${CREATE_HELP}" "SHA-512" "SHA-384" "SHA-256" "SHA" || true)"
+# Prefer AES-256 > AES-192 > AES (AES-128) (fallback)
+PRIV_PROTO="$(pick_best_supported "${CREATE_HELP}" "AES-256" "AES-192" "AES" || true)"
+
+if [[ -z "${AUTH_PROTO}" ]]; then
+  fail "No supported SNMPv3 authentication protocol found via net-snmp-create-v3-user."
+fi
+if [[ -z "${PRIV_PROTO}" ]]; then
+  fail "No supported SNMPv3 privacy (encryption) protocol found via net-snmp-create-v3-user."
 fi
 
-# Ask for configuration values
-SYSLOCATION="$(ask_non_empty 'Enter SNMP sysLocation (e.g. "Server Room RZ-1"):')"
-SYSCONTACT="$(ask_email 'Enter SNMP sysContact (valid e-mail address):')"
-ALLOWED_RANGE="$(ask_cidr 'Enter allowed IP range for SNMP queries (e.g. 192.168.1.0/24):')"
+info "Selected strongest supported SNMPv3 algorithms: auth='${AUTH_PROTO}', priv='${PRIV_PROTO}'."
 
-# Generate SNMPv3 user and passwords
-echo -e "${BOLD_CYAN}Generating SNMPv3 credentials...${RESET}"
-SNMPV3_USER="snmpv3_$(generate_random_string 8)"
-SNMPV3_AUTH_PASS="$(generate_random_string 20)"
-SNMPV3_PRIV_PASS="$(generate_random_string 32)"
+# ======= Stop snmpd before creating user =======
+info "Stopping snmpd (if running) before creating the SNMPv3 user..."
+systemctl stop snmpd >/dev/null 2>&1 || true
 
-# Info: authPriv with SHA and AES-256 is considered state of the art if supported
-# We use SHA auth and AES-256 privacy (encryption).
-AUTH_PROTO="SHA"
-PRIV_PROTO="AES"
+# ======= Create SNMPv3 user (authPriv, read-only) =======
+# net-snmp-create-v3-user stores USM keys in /var/lib/snmp/snmpd.conf
+info "Creating SNMPv3 user (read-only, authPriv)..."
+set +e
+CREATE_OUT="$(
+  (echo "y" | net-snmp-create-v3-user \
+    -ro \
+    -a "${AUTH_PROTO}" -A "${AUTH_PASS}" \
+    -x "${PRIV_PROTO}" -X "${PRIV_PASS}" \
+    "${USERNAME}") 2>&1
+)"
+RC=$?
+set -e
 
-# Backup existing config
-if [[ -f "$SNMPD_CONF" ]]; then
-  BACKUP="${SNMPD_CONF}.$(date +%Y%m%d%H%M%S).bak"
-  echo -e "${BOLD_CYAN}Backing up existing snmpd.conf to ${BACKUP}${RESET}"
-  cp "$SNMPD_CONF" "$BACKUP"
+if [[ $RC -ne 0 ]]; then
+  echo "${CREATE_OUT}"
+  fail "Failed to create SNMPv3 user."
+fi
+ok "SNMPv3 user created: ${USERNAME}"
+
+# ======= Write snmpd.conf (SNMPv3 only, UDP/161) =======
+SNMPD_CONF="/etc/snmp/snmpd.conf"
+BACKUP="${SNMPD_CONF}.$(date +%Y%m%d-%H%M%S).bak"
+
+if [[ -f "${SNMPD_CONF}" ]]; then
+  cp -a "${SNMPD_CONF}" "${BACKUP}"
+  ok "Backup created: ${BACKUP}"
 fi
 
-echo -e "${BOLD_CYAN}Writing secure SNMPv3-only configuration...${RESET}"
-
-cat > "$SNMPD_CONF" <<EOF
+info "Writing secure snmpd configuration (SNMPv3 only, UDP/161)..."
+cat > "${SNMPD_CONF}" <<EOF
 ###############################################################################
-# SNMP daemon configuration - generated by setup script
-# Only SNMPv3 is enabled; SNMPv1/v2c are disabled.
+# Managed by setup script
+# Goal: SNMPv3 only (no v1/v2c), standard port UDP/161
 #
-# NOTE: IP access restriction for SNMP queries is expected to be enforced
-#       at the firewall level as well. Allowed range (firewall): ${ALLOWED_RANGE}
+# Allowed source CIDR: ${ALLOW_CIDR}
+# NOTE: Source IP restriction is enforced by the firewall (nftables), not by snmpd.conf.
 ###############################################################################
 
-# Run as Debian-snmp user
-agentuser  Debian-snmp
-agentgroup Debian-snmp
-
-# Listen on UDP port 161 on all IPv4 interfaces by default.
-# You may restrict to a specific interface/IP if desired.
+# Listen on standard SNMP port
 agentAddress udp:161
 
-###############################################################################
-# System information
-###############################################################################
-sysLocation    ${SYSLOCATION}
-sysContact     ${SYSCONTACT}
+# System information (provided interactively)
+sysLocation  "${SYS_LOCATION}"
+sysContact   "${SYS_CONTACT}"
 
-###############################################################################
-# SNMPv3 user configuration
-# "authPriv" enforces authentication and encryption.
-# Authentication: ${AUTH_PROTO}
-# Privacy (encryption): ${PRIV_PROTO}
-###############################################################################
+# No community strings defined -> SNMPv1/v2c effectively disabled.
+# Do NOT add rocommunity or rwcommunity lines.
 
-# Create SNMPv3 user
-createUser ${SNMPV3_USER} ${AUTH_PROTO} "${SNMPV3_AUTH_PASS}" ${PRIV_PROTO} "${SNMPV3_PRIV_PASS}"
-rouser     ${SNMPV3_USER} authPriv
+# SNMPv3 access: read-only, authPriv required
+rouser ${USERNAME} authpriv
 
-###############################################################################
-# Access control
-###############################################################################
+# Reduce unnecessary log noise
+dontLogTCPWrappersConnects yes
+EOF
+ok "Configuration written: ${SNMPD_CONF}"
 
-# By default, restrict view to the entire OID tree
-view   all    included   .1                               80
+# ======= Firewall (nftables): allow CIDR to UDP/161, drop others =======
+NFT_DIR="/etc/nftables.d"
+NFT_SNMP="${NFT_DIR}/snmpd.nft"
+NFT_MAIN="/etc/nftables.conf"
 
-###############################################################################
-# Legacy SNMP versions disabled
-###############################################################################
-# No community strings, no v1/v2c access defined here.
+info "Configuring nftables rules to restrict UDP/161 to '${ALLOW_CIDR}'..."
+mkdir -p "${NFT_DIR}"
 
+# If our table already exists, remove it to avoid duplicates / load errors.
+if nft list table inet snmpd_filter >/dev/null 2>&1; then
+  nft delete table inet snmpd_filter >/dev/null 2>&1 || true
+  warn "Existing nftables table 'inet snmpd_filter' was removed and will be recreated."
+fi
+
+cat > "${NFT_SNMP}" <<EOF
+# Managed by setup script - SNMPd restriction
+# This file enforces: UDP/161 allowed only from ${ALLOW_CIDR}, dropped otherwise.
+table inet snmpd_filter {
+  chain input {
+    type filter hook input priority -150; policy accept;
+
+    udp dport 161 ip saddr ${ALLOW_CIDR} counter accept
+    udp dport 161 counter drop
+  }
+}
 EOF
 
-# Make sure correct permissions
-chown root:snmp "$SNMPD_CONF" 2>/dev/null || true
-chmod 640 "$SNMPD_CONF" 2>/dev/null || true
+# Ensure /etc/nftables.conf includes /etc/nftables.d/*.nft
+if [[ -f "${NFT_MAIN}" ]]; then
+  if ! grep -qE 'include\s+"/etc/nftables\.d/\*\.nft"' "${NFT_MAIN}"; then
+    if ! grep -qE 'include\s+".*nftables\.d.*"' "${NFT_MAIN}"; then
+      echo 'include "/etc/nftables.d/*.nft"' >> "${NFT_MAIN}"
+      ok "Added include directive to ${NFT_MAIN}"
+    else
+      warn "An include directive for nftables.d already exists in ${NFT_MAIN}. Leaving it unchanged."
+    fi
+  fi
+else
+  # Create a minimal config WITHOUT flushing existing rulesets (safer default).
+  cat > "${NFT_MAIN}" <<EOF
+#!/usr/sbin/nft -f
+# Minimal nftables config created by setup script
+include "/etc/nftables.d/*.nft"
+EOF
+  warn "${NFT_MAIN} did not exist. A minimal config was created without flushing existing rulesets."
+fi
 
-# Enable and restart snmpd
-echo -e "${BOLD_CYAN}Enabling and restarting snmpd service...${RESET}"
-systemctl enable snmpd
+systemctl enable --now nftables >/dev/null 2>&1 || true
+
+# Load config (best effort)
+if nft -f "${NFT_MAIN}" >/dev/null 2>&1; then
+  ok "nftables configuration loaded."
+else
+  warn "Failed to load nftables configuration from ${NFT_MAIN}. Please review manually."
+fi
+
+# ======= Enable and start snmpd =======
+info "Enabling autostart and starting snmpd..."
+systemctl enable snmpd >/dev/null 2>&1 || true
 systemctl restart snmpd
 
-# Write credentials file in user's home
-echo -e "${BOLD_CYAN}Writing credentials to ${CREDS_FILE}...${RESET}"
-cat > "$CREDS_FILE" <<EOF
-SNMP configuration summary
-==========================
+if systemctl is-active --quiet snmpd; then
+  ok "snmpd is running."
+else
+  warn "snmpd is not active. Check logs with 'journalctl -u snmpd --no-pager'."
+fi
 
-Config file: ${SNMPD_CONF}
+# ======= Write credentials file (for invoking user) =======
+info "Writing relevant information to ${CREDS_FILE}..."
+cat > "${CREDS_FILE}" <<EOF
+# SNMPv3 credentials and configuration summary
+# Generated on: $(date)
+#
+# IMPORTANT:
+# - This file contains plaintext secrets. Keep it secure.
+# - Recommended permissions: chmod 600 ${CREDS_FILE}
 
-sysLocation: ${SYSLOCATION}
-sysContact:  ${SYSCONTACT}
+Allowed IP range : ${ALLOW_CIDR}
+SNMP version     : v3 only
+Port             : UDP/161
 
-Allowed IP range (firewall level): ${ALLOWED_RANGE}
+sysLocation      : ${SYS_LOCATION}
+sysContact       : ${SYS_CONTACT}
 
-SNMPv3 user:           ${SNMPV3_USER}
-SNMPv3 auth protocol:  ${AUTH_PROTO}
-SNMPv3 auth password:  ${SNMPV3_AUTH_PASS}
-SNMPv3 privacy proto:  ${PRIV_PROTO}
-SNMPv3 privacy passwd: ${SNMPV3_PRIV_PASS}
+SNMPv3 username  : ${USERNAME}
 
-Example snmpwalk command:
-snmpwalk -v3 -l authPriv -u "${SNMPV3_USER}" -a ${AUTH_PROTO} -A "${SNMPV3_AUTH_PASS}" -x ${PRIV_PROTO} -X "${SNMPV3_PRIV_PASS}" localhost
+Authentication:
+  Protocol       : ${AUTH_PROTO}
+  Password       : ${AUTH_PASS}
+
+Privacy (encryption):
+  Protocol       : ${PRIV_PROTO}
+  Password       : ${PRIV_PASS}
+
+Configuration files:
+  /etc/snmp/snmpd.conf        (daemon configuration)
+  /var/lib/snmp/snmpd.conf    (SNMPv3 USM users/keys – do not edit manually)
+
+Firewall rules:
+  ${NFT_SNMP} (included via /etc/nftables.conf)
+
+Test command example (run from an allowed host):
+snmpwalk -v3 -l authPriv \\
+  -u ${USERNAME} \\
+  -a ${AUTH_PROTO} -A '${AUTH_PASS}' \\
+  -x ${PRIV_PROTO} -X '${PRIV_PASS}' \\
+  <SERVER-IP> 1.3.6.1.2.1.1
 EOF
 
-chmod 600 "$CREDS_FILE"
+chmod 600 "${CREDS_FILE}" || true
+chown "${TARGET_USER}:${TARGET_USER}" "${CREDS_FILE}" >/dev/null 2>&1 || true
+ok "Credentials file written with permissions 600."
 
-# Final colored summary
+# ======= Final colored summary =======
 echo
-echo -e "${BOLD_GREEN}SNMPv3 setup completed successfully.${RESET}"
+echo "${BOLD}${GREEN}===== Setup completed – Relevant information =====${RESET}"
+echo "${BOLD}Allowed IP range:${RESET} ${YELLOW}${ALLOW_CIDR}${RESET} ${BLUE}(enforced via firewall)${RESET}"
+echo "${BOLD}SNMP version:${RESET} ${YELLOW}v3 only${RESET}"
+echo "${BOLD}Port:${RESET} ${YELLOW}UDP/161${RESET}"
 echo
-echo -e "${BOLD_YELLOW}Relevant information:${RESET}"
-echo -e "${BOLD_CYAN}  SNMP config file: ${SNMPD_CONF}${RESET}"
-echo -e "${BOLD_CYAN}  sysLocation:      ${SYSLOCATION}${RESET}"
-echo -e "${BOLD_CYAN}  sysContact:       ${SYSCONTACT}${RESET}"
-echo -e "${BOLD_CYAN}  Allowed range (firewall): ${ALLOWED_RANGE}${RESET}"
-echo -e "${BOLD_CYAN}  SNMPv3 user:      ${SNMPV3_USER}${RESET}"
-echo -e "${BOLD_CYAN}  Auth protocol:    ${AUTH_PROTO}${RESET}"
-echo -e "${BOLD_CYAN}  Priv protocol:    ${PRIV_PROTO}${RESET}"
+echo "${BOLD}sysLocation:${RESET} ${YELLOW}${SYS_LOCATION}${RESET}"
+echo "${BOLD}sysContact:${RESET} ${YELLOW}${SYS_CONTACT}${RESET}"
 echo
-echo -e "${BOLD_YELLOW}Credentials and summary have been written to:${RESET} ${BOLD_GREEN}${CREDS_FILE}${RESET}"
+echo "${BOLD}SNMPv3 username:${RESET} ${YELLOW}${USERNAME}${RESET}"
+echo "${BOLD}Auth protocol:${RESET} ${YELLOW}${AUTH_PROTO}${RESET}"
+echo "${BOLD}Auth password:${RESET} ${YELLOW}${AUTH_PASS}${RESET}"
+echo "${BOLD}Privacy protocol:${RESET} ${YELLOW}${PRIV_PROTO}${RESET}"
+echo "${BOLD}Privacy password:${RESET} ${YELLOW}${PRIV_PASS}${RESET}"
 echo
-echo -e "${BOLD_YELLOW}Reminder:${RESET} Ensure your firewall allows UDP/161 from ${ALLOWED_RANGE}."
+echo "${BOLD}Config file:${RESET} ${YELLOW}${SNMPD_CONF}${RESET}"
+echo "${BOLD}Creds file:${RESET} ${YELLOW}${CREDS_FILE}${RESET}"
+echo "${BOLD}Firewall rules:${RESET} ${YELLOW}${NFT_SNMP}${RESET}"
+echo
+echo "${BOLD}${YELLOW}Hint:${RESET} Test from an allowed host using:"
+echo "  snmpwalk -v3 -l authPriv -u ${USERNAME} -a ${AUTH_PROTO} -A '${AUTH_PASS}' -x ${PRIV_PROTO} -X '${PRIV_PASS}' <SERVER-IP> 1.3.6.1.2.1.1"
+echo
