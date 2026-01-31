@@ -23,7 +23,7 @@ fi
 # ======= User input: allowed IP range =======
 echo "${BOLD}SNMPv3 Setup (Debian)${RESET}"
 echo
-read -r -p "From which IP address range (CIDR) should SNMP requests be accepted? (e.g. 192.168.1.0/24): " ALLOW_CIDR
+read -r -p "$(echo -e "${BOLD}${YELLOW}From which IP address range (CIDR) should SNMP requests be accepted? (e.g. 192.168.1.0/24): ${RESET}")" ALLOW_CIDR
 ALLOW_CIDR="${ALLOW_CIDR//[[:space:]]/}"
 
 if [[ -z "${ALLOW_CIDR}" ]]; then
