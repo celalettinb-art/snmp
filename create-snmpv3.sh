@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Then run the script -> bash -c "$(curl -fsSL https://raw.githubusercontent.com/celalettinb-art/paperless/refs/heads/main/paperless-ngx_install-tika-and-gotenberg-in-docker.sh)"
+# Then run the script -> bash -c "$(curl -fsSL https://github.com/celalettinb-art/snmp/blob/main/create-snmpv3.sh)"
 set -euo pipefail
 
 # ======= Colors =======
