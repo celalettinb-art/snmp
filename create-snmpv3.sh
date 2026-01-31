@@ -173,6 +173,31 @@ else
   warn "snmpd is not active. Check logs with 'journalctl -u snmpd --no-pager'."
 fi
 
+# ======= Write credentials and relevant info to file =======
+CREDS_FILE="${HOME}/snmpd.creds"
+
+cat > "${CREDS_FILE}" <<EOF
+Allowed IP range : ${ALLOW_CIDR}
+SNMP version     : v3 only
+Port             : UDP/161
+
+SNMPv3 username  : ${USERNAME}
+
+Authentication:
+  Protocol       : ${AUTH_PROTO}
+  Password       : ${AUTH_PASS}
+
+Privacy (encryption):
+  Protocol       : ${PRIV_PROTO}
+  Password       : ${PRIV_PASS}
+
+EOF
+
+# Secure the credentials file
+chmod 600 "${CREDS_FILE}"
+
+info "Credentials written to ${CREDS_FILE} with permissions 600."
+
 # ======= Summary =======
 echo
 echo "${BOLD}${GREEN}===== Setup completed – Relevant information =====${RESET}"
