@@ -103,16 +103,26 @@ USERNAME="snmpv3_$(openssl rand -hex 4)"
 AUTH_PASS="$(openssl rand -base64 36 | tr -d '\n' | tr '/+' 'Aa' | cut -c1-28)"
 PRIV_PASS="$(openssl rand -base64 40 | tr -d '\n' | tr '/+' 'Bb' | cut -c1-32)"
 
-# ======= Pick strongest supported auth/priv protocols =======
-# We select the strongest options that are supported by the installed net-snmp tools.
-CREATE_HELP="$(net-snmp-create-v3-user -h 2>&1 || true)"
+# ======= Pick strongest supported auth/priv protocols (robust parsing) =======
+# We parse from snmpwalk help because it usually prints supported -a/-x values consistently.
+WALK_HELP="$(snmpwalk -h 2>&1 || true)"
 
-pick_best_supported() {
-  # Args: help_text, candidates...
-  local help_text="$1"; shift
+extract_brace_values() {
+  # Extracts the content inside {...} for a given option (e.g. -a or -x) from help text.
+  # Returns a string like "SHA|SHA-256|SHA-512" or empty if not found.
+  local opt="$1"
+  echo "${WALK_HELP}" | sed -nE "s/.*${opt}[[:space:]]*\\{([^}]*)\\}.*/\\1/p" | head -n1
+}
+
+choose_best_from_list() {
+  # Args: list_string (separated by | or ,), candidates...
+  local list="$1"; shift
+  local normalized
+  # Normalize separators to newlines for easier matching
+  normalized="$(echo "${list}" | tr '|' '\n' | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   local c
   for c in "$@"; do
-    if echo "${help_text}" | grep -qiE "(^|[^A-Z0-9_-])${c}([^A-Z0-9_-]|$)"; then
+    if echo "${normalized}" | grep -qiE "^${c}$"; then
       echo "$c"
       return 0
     fi
@@ -120,16 +130,21 @@ pick_best_supported() {
   return 1
 }
 
-# Prefer SHA-512 > SHA-384 > SHA-256 > SHA (fallback)
-AUTH_PROTO="$(pick_best_supported "${CREATE_HELP}" "SHA-512" "SHA-384" "SHA-256" "SHA" || true)"
-# Prefer AES-256 > AES-192 > AES (AES-128) (fallback)
-PRIV_PROTO="$(pick_best_supported "${CREATE_HELP}" "AES-256" "AES-192" "AES" || true)"
+AUTH_LIST="$(extract_brace_values "-a")"
+PRIV_LIST="$(extract_brace_values "-x")"
 
+# Prefer modern options, but only if supported by this installation.
+AUTH_PROTO="$(choose_best_from_list "${AUTH_LIST}" "SHA-512" "SHA-384" "SHA-256" "SHA" || true)"
+PRIV_PROTO="$(choose_best_from_list "${PRIV_LIST}" "AES-256" "AES-192" "AES" || true)"
+
+# Last-resort fallback (some builds don't show braces in help, but still accept SHA/AES)
 if [[ -z "${AUTH_PROTO}" ]]; then
-  fail "No supported SNMPv3 authentication protocol found via net-snmp-create-v3-user."
+  warn "Could not detect supported auth algorithms from snmpwalk help. Falling back to SHA."
+  AUTH_PROTO="SHA"
 fi
 if [[ -z "${PRIV_PROTO}" ]]; then
-  fail "No supported SNMPv3 privacy (encryption) protocol found via net-snmp-create-v3-user."
+  warn "Could not detect supported privacy algorithms from snmpwalk help. Falling back to AES."
+  PRIV_PROTO="AES"
 fi
 
 info "Selected strongest supported SNMPv3 algorithms: auth='${AUTH_PROTO}', priv='${PRIV_PROTO}'."
