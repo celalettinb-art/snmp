@@ -4,6 +4,7 @@
 # All messages are in English, interactive questions are bold and yellow.
 # This script configures snmpd for SNMPv3 only, on UDP port 161.
 # It stores credentials and settings also in ~/snmpd.creds.
+# Run the script -> bash -c "$(curl -fsSL https://raw.githubusercontent.com/celalettinb-art/snmp/refs/heads/main/install-and-configure-snmpv3-on-debian.sh)"
 
 set -euo pipefail
 
