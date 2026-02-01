@@ -5,7 +5,7 @@
 # Creates a read-only SNMPv3 user with the strongest supported auth/priv methods
 # Restricts UDP/161 by source CIDR via nftables firewall rules
 # Writes a summary to ~/snmpd.creds (for the invoking user)
-# Run the script -> bash -c "$(curl -fsSL https://raw.githubusercontent.com/celalettinb-art/snmp/refs/heads/main/install-and-configure-snmpv3-on-debian.sh)"
+# Run the script -> bash -c "$(curl -fsSL https://raw.githubusercontent.com/celalettinb-art/snmp/refs/heads/main/install-and-configure-snmpv3-on-debian-generic.sh)"
 
 set -euo pipefail
 
